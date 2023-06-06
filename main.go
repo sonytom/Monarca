@@ -24,14 +24,7 @@ func init() {
 	SimLogger.Init()
 }
 
-const (
-	Pending = "-1"
-	Created = "1"
-	Local   = "2"
-)
-
 func main() {
-	//Teste()
 	envcon.Load(&config)
 	crudadapter.Init(crudadapter.Config{
 		CrudUrl: config.Url,
@@ -55,8 +48,17 @@ func main() {
 }
 
 type Script struct {
+	Comandosql string   `json:"comandosql"`
+	Situacao   Elements `json:"situacao"`
+}
+
+type ScriptResponse struct {
 	Comandosql string `json:"comandosql"`
 	Situacao   string `json:"situacao"`
+}
+
+type Elements struct {
+	Elements []int `json:"Elements"`
 }
 
 type Comandos struct {
@@ -67,7 +69,6 @@ type Comando struct {
 	SQL string `xml:",cdata"`
 }
 
-// dispatch  -
 func scriptDetail(c *gin.Context) {
 	scriptTime := c.Query("scripttime")
 	if scriptTime == "" {
@@ -75,74 +76,96 @@ func scriptDetail(c *gin.Context) {
 		return
 	}
 
-	// ler arquivo
 	// verificar se tem que ser o mesmo em toda a aplicação guid
 
 	if scriptTime != "" {
-		scripts := []Script{}
-		crudResponseDb := GetScriptsDB(scriptTime, scripts, c)
-		crudResponseLocaly := GetScriptsLocaly(scriptTime, crudResponseDb, c)
 
-		c.JSON(http.StatusOK, crudResponseLocaly)
-	} else {
-		SimLogger.Local.Send(SimLogger.ShortLog{Session: uuid.New().String(), Header: "parou tudo", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Warrrrning"})
-		c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": -1, "mensagem": "cliente não exportou nenhuma regra"})
-	}
+		reponseDB, err := GetScriptsDB(scriptTime)
 
-}
-
-func GetScriptsDB(scriptTime string, scripts []Script, c *gin.Context) (allScripts []Script) {
-	cmds, err := crudadapter.EvalQuery("monarca/getSituacao", "", config.PreSharedToken, crudadapter.M{"arquivo": scriptTime}, "")
-	if err := cmds[0].RowsAsStructs(&scripts); err != nil {
-		log.Println("erro para fazer o parse ", err.Error())
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	if err != nil {
-		log.Println("Erro ao executar a query", err.Error())
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
-	}
-	return scripts
-}
-
-func GetScriptsLocaly(scriptTime string, localyScripts []Script, c *gin.Context) (allScripts []Script) {
-
-	if len(localyScripts) == 0 {
-		// caminho da pasta no config
-		xmlFile := readFile(config.FilePath+scriptTime+config.Extension, c)
-
-		var comandos Comandos
-
-		if err := xml.Unmarshal(xmlFile, &comandos); err != nil {
-			SimLogger.Local.Send(SimLogger.ShortLog{Session: uuid.New().String(), Header: "parou tudo", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Warrrrning"})
+		if err != nil {
+			log.Println("Erro ao executar a query", err.Error())
 			c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": -1, "mensagem": "cliente não exportou nenhuma regra"})
 			return
 		}
 
-		for _, comando := range comandos.Comandos {
+		mapperResponse := make([]ScriptResponse, 0)
 
-			re := regexp.MustCompile(`\s+`)
-			mapperReponse := Script{
-				Comandosql: re.ReplaceAllString(comando.SQL, " "),
-				Situacao:   Local,
+		mapperResponse = setMessages(reponseDB, mapperResponse)
+
+		if len(reponseDB) == 0 {
+			responseLocaly, err := GetScriptsLocaly(scriptTime, reponseDB)
+
+			mapperResponse = setMessages(responseLocaly, mapperResponse)
+			if err != nil {
+				log.Println("Erro ao executar a query", err.Error())
+				c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": -1, "mensagem": "cliente não exportou nenhuma regra"})
+				return
 			}
-			c.JSON(http.StatusOK, mapperReponse)
 		}
-
+		c.JSON(http.StatusOK, mapperResponse)
 	} else {
-		c.JSON(http.StatusOK, localyScripts)
+		SimLogger.Local.Send(SimLogger.ShortLog{Session: uuid.New().String(), Header: "parou tudo", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Warrrrning"})
+		c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": -1, "mensagem": "cliente não exportou nenhuma regra"})
 	}
-
-	return localyScripts
 }
 
-func readFile(filePath string, c *gin.Context) []byte {
+func setMessages(scripts []Script, mapperResponse []ScriptResponse) []ScriptResponse {
+	for i, comando := range scripts {
+		mapperResponse = append(mapperResponse, ScriptResponse{Comandosql: comando.Comandosql, Situacao: "Pendente"})
+		if scripts[i].Situacao.Elements[len(scripts[i].Situacao.Elements)-1] == 1 {
+			mapperResponse[i].Situacao = "Sucesso"
+		}
+
+		if scripts[i].Situacao.Elements[len(scripts[i].Situacao.Elements)-1] == -2 {
+			mapperResponse[i].Situacao = "Não Executado"
+		}
+	}
+	return mapperResponse
+}
+
+func GetScriptsDB(scriptTime string) ([]Script, error) {
+	scripts := make([]Script, 0)
+	cmds, err := crudadapter.EvalQuery("monarca/getSituacao", "", config.PreSharedToken, crudadapter.M{"arquivo": scriptTime}, "")
+	if err := cmds[0].RowsAsStructs(&scripts); err != nil {
+		log.Println("erro para fazer o parse ", err.Error())
+		return scripts, err
+	}
+	if err != nil {
+		log.Println("Erro ao executar a query", err.Error())
+		return scripts, err
+	}
+	return scripts, nil
+}
+
+func GetScriptsLocaly(scriptTime string, localyScripts []Script) ([]Script, error) {
+	xmlFile, err := readFile(config.FilePath + scriptTime + config.Extension)
+
+	if err != nil {
+		log.Println("Erro ao executar a query", err.Error())
+		return localyScripts, err
+	}
+	var comandos Comandos
+	if err := xml.Unmarshal(xmlFile, &comandos); err != nil {
+		SimLogger.Local.Send(SimLogger.ShortLog{Session: uuid.New().String(), Header: "parou tudo", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Warrrrning"})
+		return localyScripts, err
+	}
+
+	novo := make([]Script, len(comandos.Comandos))
+
+	for i, tt := range comandos.Comandos {
+		re := regexp.MustCompile(`\s+`)
+		novo[i].Comandosql = re.ReplaceAllString(tt.SQL, " ")
+		novo[i].Situacao.Elements = []int{-2}
+	}
+
+	return novo, nil
+}
+
+func readFile(filePath string) ([]byte, error) {
 	xml, err := os.ReadFile(filePath)
 	if err != nil {
 		SimLogger.Local.Send(SimLogger.ShortLog{Session: uuid.New().String(), Header: "parou tudo", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Warrrrning"})
-		c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": -1, "mensagem": "cliente não exportou nenhuma regra"})
-		return xml
+		return xml, err
 	}
-	return xml
+	return xml, err
 }
