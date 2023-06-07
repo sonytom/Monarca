@@ -20,7 +20,6 @@ func init() {
 	os.Setenv("SIMLOGGER_COMPONENT", "Monarca")
 	os.Setenv("SIMLOGGER_SYSTEM", "simfrete")
 	os.Setenv("SIMLOGGER_AMQ_URL", "mqtest.simfrete.com:61616")
-
 	SimLogger.Init()
 }
 
@@ -47,25 +46,29 @@ func main() {
 	}
 }
 
+const (
+	for_empty_structure = -2
+)
+
 type Script struct {
 	Comandosql string   `json:"comandosql"`
 	Situacao   Elements `json:"situacao"`
 }
 
-type ScriptResponse struct {
-	Comandosql string `json:"comandosql"`
-	Situacao   string `json:"situacao"`
+type ResultScriptResponse struct {
+	Comandosql string
+	Situacao   string
 }
 
 type Elements struct {
 	Elements []int `json:"Elements"`
 }
 
-type Comandos struct {
-	Comandos []Comando `xml:"comando"`
+type Commands struct {
+	Commands []Command `xml:"comando"`
 }
 
-type Comando struct {
+type Command struct {
 	SQL string `xml:",cdata"`
 }
 
@@ -75,96 +78,104 @@ func scriptDetail(c *gin.Context) {
 		c.String(http.StatusBadRequest, "'scriptTime' não enviado")
 		return
 	}
-
-	// verificar se tem que ser o mesmo em toda a aplicação guid
+	sessionLogId := uuid.New().String()
 
 	if scriptTime != "" {
 
-		reponseDB, err := GetScriptsDB(scriptTime)
+		crudAdapterResponse, err := GetScriptsDB(scriptTime, sessionLogId)
 
 		if err != nil {
-			log.Println("Erro ao executar a query", err.Error())
-			c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": -1, "mensagem": "cliente não exportou nenhuma regra"})
+			SimLogger.Local.Send(SimLogger.ShortLog{Session: sessionLogId, Header: "stoped", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Erro ao executar a query : " + err.Error()})
+			c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"status": -1, "mensagem": "Erro ao executar a query"})
 			return
 		}
 
-		mapperResponse := make([]ScriptResponse, 0)
+		scriptResponse := make([]ResultScriptResponse, 0)
 
-		mapperResponse = setMessages(reponseDB, mapperResponse)
+		scriptResponse = setMessages(crudAdapterResponse, scriptResponse)
 
-		if len(reponseDB) == 0 {
-			responseLocaly, err := GetScriptsLocaly(scriptTime, reponseDB)
-
-			mapperResponse = setMessages(responseLocaly, mapperResponse)
+		if len(crudAdapterResponse) == 0 {
+			localSearch, err := GetScriptsLocaly(scriptTime, crudAdapterResponse, sessionLogId)
+			scriptResponse = setMessages(localSearch, scriptResponse)
 			if err != nil {
-				log.Println("Erro ao executar a query", err.Error())
-				c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": -1, "mensagem": "cliente não exportou nenhuma regra"})
+				log.Println("Erro em executar localmente : ", err.Error())
+				c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"status": -2, "mensagem": "Erro na busca local do arquivo"})
 				return
 			}
 		}
-		c.JSON(http.StatusOK, mapperResponse)
+		c.JSON(http.StatusOK, scriptResponse)
 	} else {
-		SimLogger.Local.Send(SimLogger.ShortLog{Session: uuid.New().String(), Header: "parou tudo", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Warrrrning"})
-		c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": -1, "mensagem": "cliente não exportou nenhuma regra"})
+		SimLogger.Local.Send(SimLogger.ShortLog{Session: sessionLogId, Header: "stoped", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Warrrrning"})
+		c.AbortWithStatusJSON(http.StatusOK, gin.H{"status": -1, "mensagem": "deu falha"})
 	}
 }
 
-func setMessages(scripts []Script, mapperResponse []ScriptResponse) []ScriptResponse {
+func setMessages(scripts []Script, scriptResponse []ResultScriptResponse) []ResultScriptResponse {
 	for i, comando := range scripts {
-		mapperResponse = append(mapperResponse, ScriptResponse{Comandosql: comando.Comandosql, Situacao: "Pendente"})
+		scriptResponse = append(scriptResponse, ResultScriptResponse{
+			Comandosql: comando.Comandosql,
+			Situacao:   "Pendente",
+		})
+
 		if scripts[i].Situacao.Elements[len(scripts[i].Situacao.Elements)-1] == 1 {
-			mapperResponse[i].Situacao = "Sucesso"
+			scriptResponse[i].Situacao = "Sucesso"
 		}
 
-		if scripts[i].Situacao.Elements[len(scripts[i].Situacao.Elements)-1] == -2 {
-			mapperResponse[i].Situacao = "Não Executado"
+		if scripts[i].Situacao.Elements[len(scripts[i].Situacao.Elements)-1] == for_empty_structure {
+			scriptResponse[i].Situacao = "Não Executado"
 		}
 	}
-	return mapperResponse
+	return scriptResponse
 }
 
-func GetScriptsDB(scriptTime string) ([]Script, error) {
+func GetScriptsDB(scriptTime string, sessionLogId string) ([]Script, error) {
 	scripts := make([]Script, 0)
 	cmds, err := crudadapter.EvalQuery("monarca/getSituacao", "", config.PreSharedToken, crudadapter.M{"arquivo": scriptTime}, "")
 	if err := cmds[0].RowsAsStructs(&scripts); err != nil {
-		log.Println("erro para fazer o parse ", err.Error())
+		SimLogger.Local.Send(SimLogger.ShortLog{Session: sessionLogId, Header: "stoped", Level: SimLogger.LOG_LEVEL_ERROR, Body: "erro para fazer o parse :" + err.Error()})
 		return scripts, err
 	}
 	if err != nil {
-		log.Println("Erro ao executar a query", err.Error())
+		SimLogger.Local.Send(SimLogger.ShortLog{Session: sessionLogId, Header: "stoped", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Erro ao executar a query" + err.Error()})
 		return scripts, err
 	}
 	return scripts, nil
 }
 
-func GetScriptsLocaly(scriptTime string, localyScripts []Script) ([]Script, error) {
-	xmlFile, err := readFile(config.FilePath + scriptTime + config.Extension)
+func GetScriptsLocaly(scriptTime string, scripts []Script, sessionLogId string) ([]Script, error) {
+	xmlFile, err := readFile(config.FilePath+scriptTime+config.Extension, sessionLogId)
 
 	if err != nil {
 		log.Println("Erro ao executar a query", err.Error())
-		return localyScripts, err
+		SimLogger.Local.Send(SimLogger.ShortLog{Session: sessionLogId, Header: "stoped", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Erro ao fazer o parse do arquvo xml : " + err.Error()})
+		return scripts, err
 	}
-	var comandos Comandos
-	if err := xml.Unmarshal(xmlFile, &comandos); err != nil {
-		SimLogger.Local.Send(SimLogger.ShortLog{Session: uuid.New().String(), Header: "parou tudo", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Warrrrning"})
-		return localyScripts, err
-	}
-
-	novo := make([]Script, len(comandos.Comandos))
-
-	for i, tt := range comandos.Comandos {
-		re := regexp.MustCompile(`\s+`)
-		novo[i].Comandosql = re.ReplaceAllString(tt.SQL, " ")
-		novo[i].Situacao.Elements = []int{-2}
+	var commands Commands
+	if err := xml.Unmarshal(xmlFile, &commands); err != nil {
+		SimLogger.Local.Send(SimLogger.ShortLog{Session: sessionLogId, Header: "stoped", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Erro ao fazer o unmarshal do objeto : " + err.Error()})
+		return scripts, err
 	}
 
-	return novo, nil
+	locallyScripts := serializeSql(commands)
+
+	return locallyScripts, nil
 }
 
-func readFile(filePath string) ([]byte, error) {
+func serializeSql(commands Commands) []Script {
+	locallyScripts := make([]Script, len(commands.Commands))
+
+	for i, command := range commands.Commands {
+		re := regexp.MustCompile(`\s+`)
+		locallyScripts[i].Comandosql = re.ReplaceAllString(command.SQL, " ")
+		locallyScripts[i].Situacao.Elements = []int{for_empty_structure}
+	}
+	return locallyScripts
+}
+
+func readFile(filePath string, sessionLogId string) ([]byte, error) {
 	xml, err := os.ReadFile(filePath)
 	if err != nil {
-		SimLogger.Local.Send(SimLogger.ShortLog{Session: uuid.New().String(), Header: "parou tudo", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Warrrrning"})
+		SimLogger.Local.Send(SimLogger.ShortLog{Session: sessionLogId, Header: "stoped", Level: SimLogger.LOG_LEVEL_ERROR, Body: "Erro ao ler o arquivo" + err.Error()})
 		return xml, err
 	}
 	return xml, err
